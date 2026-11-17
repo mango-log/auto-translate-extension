@@ -2,7 +2,10 @@
   if (window.__aiAutoTranslateLoaded) return;
   window.__aiAutoTranslateLoaded = true;
 
-  const BATCH_SIZE = 25;
+  const BATCH_SIZE = 40;
+  const BATCH_CHAR_LIMIT = 4000;
+  const TEXT_CONCURRENCY = 5;
+  const IMAGE_CONCURRENCY = 3;
   const MIN_IMG_SIZE = 80;
   const OVERLAY_CLASS = 'ai-translate-img-overlay';
 
@@ -25,6 +28,7 @@
         const text = node.textContent.trim();
         if (!text || text.length < 2) return NodeFilter.FILTER_REJECT;
         if (/^[\d\s\p{P}\p{S}]+$/u.test(text)) return NodeFilter.FILTER_REJECT;
+        if (parent.checkVisibility && !parent.checkVisibility()) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       }
     });
@@ -50,33 +54,83 @@
     chrome.runtime.sendMessage({ action: 'translateProgress', done, total, phase }).catch?.(() => {});
   }
 
+  function isInViewport(node) {
+    const rect = node.parentElement?.getBoundingClientRect();
+    return rect && rect.bottom > 0 && rect.top < window.innerHeight;
+  }
+
+  async function runPool(tasks, concurrency) {
+    let idx = 0;
+    const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, async () => {
+      while (idx < tasks.length && !cancelled) {
+        const task = tasks[idx++];
+        await task();
+      }
+    });
+    await Promise.all(workers);
+  }
+
   async function translateAllText(sourceLang, targetLang) {
     const nodes = collectTextNodes();
-    const total = nodes.length;
+
+    const uniqueTexts = new Map();
+    for (const node of nodes) {
+      const text = node.textContent.trim();
+      if (!uniqueTexts.has(text)) uniqueTexts.set(text, []);
+      uniqueTexts.get(text).push(node);
+    }
+
+    const entries = [...uniqueTexts.entries()].sort((a, b) => {
+      const aVis = a[1].some(isInViewport) ? 0 : 1;
+      const bVis = b[1].some(isInViewport) ? 0 : 1;
+      return aVis - bVis;
+    });
+
+    const batches = [];
+    let current = [];
+    let currentChars = 0;
+    for (const entry of entries) {
+      current.push(entry);
+      currentChars += entry[0].length;
+      if (current.length >= BATCH_SIZE || currentChars >= BATCH_CHAR_LIMIT) {
+        batches.push(current);
+        current = [];
+        currentChars = 0;
+      }
+    }
+    if (current.length) batches.push(current);
+
+    const total = entries.length;
     let done = 0;
+    let fatalError = null;
 
-    for (let i = 0; i < nodes.length; i += BATCH_SIZE) {
-      if (cancelled) return;
-      const batch = nodes.slice(i, i + BATCH_SIZE);
-      const texts = batch.map(n => n.textContent.trim());
-
+    const tasks = batches.map(batch => async () => {
+      if (fatalError) return;
+      const texts = batch.map(([text]) => text);
       const res = await sendBg({ action: 'aiTranslateTexts', texts, sourceLang, targetLang });
       if (cancelled) return;
 
       if (res.ok) {
-        batch.forEach((node, j) => {
-          if (!node.isConnected) return;
-          const original = node.textContent;
-          if (!originalTexts.has(node)) originalTexts.set(node, original);
-          node.textContent = original.replace(original.trim(), res.translations[j]);
+        batch.forEach(([text, nodeList], j) => {
+          const translation = res.translations[j];
+          for (const node of nodeList) {
+            if (!node.isConnected) continue;
+            const original = node.textContent;
+            if (!originalTexts.has(node)) originalTexts.set(node, original);
+            node.textContent = original.replace(text, translation);
+          }
         });
       } else if (res.error === 'NO_API_KEY') {
-        throw new Error('NO_API_KEY');
+        fatalError = new Error('NO_API_KEY');
+        return;
       }
 
-      done = Math.min(i + BATCH_SIZE, total);
+      done += batch.length;
       reportProgress(done, total, 'text');
-    }
+    });
+
+    await runPool(tasks, TEXT_CONCURRENCY);
+    if (fatalError) throw fatalError;
   }
 
   function positionOverlay(overlay, img) {
@@ -131,8 +185,7 @@
     const total = imgs.length;
     let done = 0;
 
-    for (const img of imgs) {
-      if (cancelled) return;
+    const tasks = imgs.map(img => async () => {
       const res = await sendBg({
         action: 'aiTranslateImage',
         imageUrl: img.currentSrc,
@@ -144,7 +197,9 @@
       }
       done++;
       reportProgress(done, total, 'image');
-    }
+    });
+
+    await runPool(tasks, IMAGE_CONCURRENCY);
   }
 
   function restore() {
