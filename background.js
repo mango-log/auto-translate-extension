@@ -12,6 +12,7 @@ function langName(code) {
 
 async function getSettings() {
   return chrome.storage.local.get({
+    engine: 'google',
     provider: 'anthropic',
     apiKey: '',
     model: '',
@@ -150,7 +151,50 @@ async function callAI(userContent, maxTokens) {
   throw new Error(`Unknown provider: ${provider}`);
 }
 
+const GOOGLE_CHUNK_CHARS = 1000;
+
+async function callGoogleChunk(texts, sourceLang, targetLang) {
+  const sl = sourceLang === 'auto' ? 'auto' : sourceLang;
+  const params = new URLSearchParams({ client: 'dict-chrome-ex', sl, tl: targetLang });
+  texts.forEach(t => params.append('q', t));
+  const res = await fetch(`https://translate.googleapis.com/translate_a/t?${params}`);
+  if (!res.ok) throw new Error(`Google Translate error (${res.status})`);
+  const data = await res.json();
+  const list = Array.isArray(data) ? data : [data];
+  return texts.map((t, i) => {
+    const item = list[i];
+    if (typeof item === 'string') return item;
+    if (Array.isArray(item) && typeof item[0] === 'string') return item[0];
+    return t;
+  });
+}
+
+async function callGoogleTranslate(texts, sourceLang, targetLang) {
+  const chunks = [];
+  let current = [];
+  let chars = 0;
+  for (const t of texts) {
+    if (current.length && chars + t.length > GOOGLE_CHUNK_CHARS) {
+      chunks.push(current);
+      current = [];
+      chars = 0;
+    }
+    current.push(t);
+    chars += t.length;
+  }
+  if (current.length) chunks.push(current);
+
+  const results = await Promise.all(
+    chunks.map(chunk => callGoogleChunk(chunk, sourceLang, targetLang))
+  );
+  return results.flat();
+}
+
 async function translateTexts(texts, sourceLang, targetLang) {
+  const { engine } = await getSettings();
+  if (engine === 'google') {
+    return callGoogleTranslate(texts, sourceLang, targetLang);
+  }
   const raw = await callAI(buildTextPrompt(texts, sourceLang, targetLang), 8192);
   const arr = extractJson(raw);
   if (!Array.isArray(arr)) throw new Error('Unexpected response shape');

@@ -14,6 +14,17 @@ const settingsStatus = $('settingsStatus');
 const settingsDetails = $('settingsDetails');
 const selOriginal = $('selOriginal');
 const selTranslated = $('selTranslated');
+const engine = $('engine');
+const engineHint = $('engineHint');
+
+const ENGINE_HINTS = {
+  google: '무료 Google 번역을 사용합니다. 이미지 번역은 AI 키가 있을 때만 동작합니다.',
+  ai: '설정한 AI 제공자로 자연스러운 번역을 합니다. API 호출 비용이 발생합니다.'
+};
+
+function updateEngineHint() {
+  engineHint.textContent = ENGINE_HINTS[engine.value] || '';
+}
 
 const MODEL_PLACEHOLDERS = {
   anthropic: 'claude-opus-5',
@@ -50,17 +61,25 @@ async function ensureContentScript(tabId) {
 }
 
 chrome.storage.local.get(
-  { provider: 'anthropic', apiKey: '', model: '', sourceLang: 'auto', targetLang: 'ko' },
+  { engine: 'google', provider: 'anthropic', apiKey: '', model: '', sourceLang: 'auto', targetLang: 'ko' },
   settings => {
+    engine.value = settings.engine;
     provider.value = settings.provider;
     apiKey.value = settings.apiKey;
     model.value = settings.model;
     sourceLang.value = settings.sourceLang;
     targetLang.value = settings.targetLang;
     model.placeholder = MODEL_PLACEHOLDERS[settings.provider] || '';
-    if (!settings.apiKey) settingsDetails.open = true;
+    if (settings.engine === 'ai' && !settings.apiKey) settingsDetails.open = true;
+    updateEngineHint();
   }
 );
+
+engine.addEventListener('change', () => {
+  chrome.storage.local.set({ engine: engine.value });
+  updateEngineHint();
+  if (engine.value === 'ai' && !apiKey.value) settingsDetails.open = true;
+});
 
 provider.addEventListener('change', () => {
   model.placeholder = MODEL_PLACEHOLDERS[provider.value] || '';
@@ -89,8 +108,8 @@ translateToggle.addEventListener('change', async () => {
   if (!tab?.id) return;
 
   if (translateToggle.checked) {
-    const { apiKey: key } = await chrome.storage.local.get({ apiKey: '' });
-    if (!key) {
+    const { engine: eng, apiKey: key } = await chrome.storage.local.get({ engine: 'google', apiKey: '' });
+    if (eng === 'ai' && !key) {
       translateToggle.checked = false;
       settingsDetails.open = true;
       setStatus(status, 'AI 설정에서 API 키를 먼저 저장해주세요', 'error');
@@ -104,6 +123,7 @@ translateToggle.addEventListener('change', async () => {
     await ensureContentScript(tab.id);
     const res = await sendToTab(tab.id, {
       action: 'startTranslate',
+      engine: eng,
       sourceLang: sourceLang.value,
       targetLang: targetLang.value
     });

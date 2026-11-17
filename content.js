@@ -10,6 +10,8 @@
   const OVERLAY_CLASS = 'ai-translate-img-overlay';
 
   const originalTexts = new Map();
+  const textCache = new Map();
+  const imageCache = new Map();
   const overlays = [];
   let translated = false;
   let running = false;
@@ -70,8 +72,18 @@
     await Promise.all(workers);
   }
 
-  async function translateAllText(sourceLang, targetLang) {
+  function applyTranslation(text, translation, nodeList) {
+    for (const node of nodeList) {
+      if (!node.isConnected) continue;
+      const original = node.textContent;
+      if (!originalTexts.has(node)) originalTexts.set(node, original);
+      node.textContent = original.replace(text, translation);
+    }
+  }
+
+  async function translateAllText(engine, sourceLang, targetLang) {
     const nodes = collectTextNodes();
+    const cacheKey = text => `${engine}|${sourceLang}|${targetLang}|${text}`;
 
     const uniqueTexts = new Map();
     for (const node of nodes) {
@@ -79,6 +91,17 @@
       if (!uniqueTexts.has(text)) uniqueTexts.set(text, []);
       uniqueTexts.get(text).push(node);
     }
+
+    const cached = [];
+    for (const [text, nodeList] of uniqueTexts) {
+      const hit = textCache.get(cacheKey(text));
+      if (hit !== undefined) {
+        applyTranslation(text, hit, nodeList);
+        cached.push(text);
+      }
+    }
+    cached.forEach(text => uniqueTexts.delete(text));
+    if (uniqueTexts.size === 0) return;
 
     const entries = [...uniqueTexts.entries()].sort((a, b) => {
       const aVis = a[1].some(isInViewport) ? 0 : 1;
@@ -108,17 +131,14 @@
       if (fatalError) return;
       const texts = batch.map(([text]) => text);
       const res = await sendBg({ action: 'aiTranslateTexts', texts, sourceLang, targetLang });
-      if (cancelled) return;
 
       if (res.ok) {
+        batch.forEach(([text], j) => {
+          textCache.set(cacheKey(text), res.translations[j]);
+        });
+        if (cancelled) return;
         batch.forEach(([text, nodeList], j) => {
-          const translation = res.translations[j];
-          for (const node of nodeList) {
-            if (!node.isConnected) continue;
-            const original = node.textContent;
-            if (!originalTexts.has(node)) originalTexts.set(node, original);
-            node.textContent = original.replace(text, translation);
-          }
+          applyTranslation(text, res.translations[j], nodeList);
         });
       } else if (res.error === 'NO_API_KEY') {
         fatalError = new Error('NO_API_KEY');
@@ -186,14 +206,22 @@
     let done = 0;
 
     const tasks = imgs.map(img => async () => {
-      const res = await sendBg({
-        action: 'aiTranslateImage',
-        imageUrl: img.currentSrc,
-        targetLang
-      });
+      const key = `${targetLang}|${img.currentSrc}`;
+      let result = imageCache.get(key);
+      if (result === undefined) {
+        const res = await sendBg({
+          action: 'aiTranslateImage',
+          imageUrl: img.currentSrc,
+          targetLang
+        });
+        if (res.ok) {
+          result = { hasText: res.hasText, translation: res.translation };
+          imageCache.set(key, result);
+        }
+      }
       if (cancelled) return;
-      if (res.ok && res.hasText && res.translation) {
-        createOverlay(img, res.translation);
+      if (result?.hasText && result.translation) {
+        createOverlay(img, result.translation);
       }
       done++;
       reportProgress(done, total, 'image');
@@ -223,7 +251,7 @@
       cancelled = false;
       (async () => {
         try {
-          await translateAllText(message.sourceLang, message.targetLang);
+          await translateAllText(message.engine || 'ai', message.sourceLang, message.targetLang);
           if (!cancelled) await translateImages(message.targetLang);
           translated = !cancelled;
           chrome.runtime.sendMessage({
