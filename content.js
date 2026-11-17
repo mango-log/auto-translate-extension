@@ -153,50 +153,56 @@
     if (fatalError) throw fatalError;
   }
 
-  function positionOverlay(overlay, img) {
+  function positionLineOverlay(overlay, img, frac) {
     const rect = img.getBoundingClientRect();
-    overlay.style.left = `${rect.left + window.scrollX}px`;
-    overlay.style.top = `${rect.top + window.scrollY}px`;
-    overlay.style.width = `${rect.width}px`;
-    overlay.style.height = `${rect.height}px`;
+    const lineHeight = frac.h * rect.height;
+    const fontSize = Math.min(Math.max(lineHeight * 0.75, 9), 16);
+    overlay.style.left = `${rect.left + window.scrollX + frac.x * rect.width}px`;
+    overlay.style.top = `${rect.top + window.scrollY + frac.yBottom * rect.height}px`;
+    overlay.style.maxWidth = `${rect.width - frac.x * rect.width}px`;
+    overlay.style.fontSize = `${fontSize}px`;
   }
 
-  function createOverlay(img, text) {
+  function createLineOverlay(img, bbox, text) {
+    const nw = img.naturalWidth || 1;
+    const nh = img.naturalHeight || 1;
+    const frac = {
+      x: bbox.x0 / nw,
+      yBottom: bbox.y1 / nh,
+      h: (bbox.y1 - bbox.y0) / nh
+    };
+
     const overlay = document.createElement('div');
     overlay.className = OVERLAY_CLASS;
     overlay.textContent = text;
     Object.assign(overlay.style, {
       position: 'absolute',
       zIndex: '2147483646',
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      textAlign: 'center',
-      padding: '6px',
+      padding: '1px 4px',
       boxSizing: 'border-box',
-      background: 'rgba(0, 0, 0, 0.65)',
+      background: 'rgba(0, 0, 0, 0.75)',
       color: '#fff',
-      fontSize: '14px',
-      lineHeight: '1.4',
-      whiteSpace: 'pre-wrap',
+      lineHeight: '1.3',
+      whiteSpace: 'nowrap',
       overflow: 'hidden',
+      textOverflow: 'ellipsis',
       pointerEvents: 'none',
-      borderRadius: '4px',
+      borderRadius: '3px',
       fontFamily: '-apple-system, BlinkMacSystemFont, sans-serif'
     });
-    positionOverlay(overlay, img);
+    positionLineOverlay(overlay, img, frac);
     document.body.appendChild(overlay);
-    overlays.push({ overlay, img });
+    overlays.push({ overlay, img, frac });
   }
 
   function repositionAll() {
-    overlays.forEach(({ overlay, img }) => {
-      if (img.isConnected) positionOverlay(overlay, img);
+    overlays.forEach(({ overlay, img, frac }) => {
+      if (img.isConnected) positionLineOverlay(overlay, img, frac);
     });
   }
   window.addEventListener('resize', repositionAll);
 
-  async function translateImages(targetLang) {
+  async function translateImages(engine, sourceLang, targetLang) {
     const imgs = [...document.querySelectorAll('img')].filter(img => {
       const r = img.getBoundingClientRect();
       return r.width >= MIN_IMG_SIZE && r.height >= MIN_IMG_SIZE && img.currentSrc;
@@ -206,22 +212,25 @@
     let done = 0;
 
     const tasks = imgs.map(img => async () => {
-      const key = `${targetLang}|${img.currentSrc}`;
-      let result = imageCache.get(key);
-      if (result === undefined) {
+      const key = `${engine}|${sourceLang}|${targetLang}|${img.currentSrc}`;
+      let lines = imageCache.get(key);
+      if (lines === undefined) {
         const res = await sendBg({
           action: 'aiTranslateImage',
           imageUrl: img.currentSrc,
+          sourceLang,
           targetLang
         });
         if (res.ok) {
-          result = { hasText: res.hasText, translation: res.translation };
-          imageCache.set(key, result);
+          lines = res.lines;
+          imageCache.set(key, lines);
         }
       }
       if (cancelled) return;
-      if (result?.hasText && result.translation) {
-        createOverlay(img, result.translation);
+      if (lines) {
+        for (const line of lines) {
+          if (line.translation) createLineOverlay(img, line.bbox, line.translation);
+        }
       }
       done++;
       reportProgress(done, total, 'image');
@@ -252,7 +261,7 @@
       (async () => {
         try {
           await translateAllText(message.engine || 'ai', message.sourceLang, message.targetLang);
-          if (!cancelled) await translateImages(message.targetLang);
+          if (!cancelled) await translateImages(message.engine || 'ai', message.sourceLang, message.targetLang);
           translated = !cancelled;
           chrome.runtime.sendMessage({
             action: 'translateDone',

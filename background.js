@@ -43,15 +43,6 @@ function buildTextPrompt(texts, sourceLang, targetLang) {
   ].join('\n');
 }
 
-function buildImagePrompt(targetLang) {
-  return [
-    `Look at this image. If it contains readable text, extract the text and translate it to ${langName(targetLang)}.`,
-    'Respond with ONLY a JSON object, no markdown or code fences:',
-    '{"hasText": true/false, "translation": "translated text, preserving line breaks as \\n"}',
-    'If there is no meaningful text, respond {"hasText": false, "translation": ""}.'
-  ].join('\n');
-}
-
 function extractJson(raw) {
   let s = raw.trim();
   const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -221,27 +212,59 @@ async function fetchImageAsBase64(url) {
   return { mediaType, data: btoa(binary) };
 }
 
-async function translateImage(imageUrl, targetLang) {
+const OCR_LANGS = {
+  en: 'eng', ko: 'kor', ja: 'jpn', zh: 'chi_sim',
+  es: 'spa', fr: 'fra', de: 'deu', vi: 'vie', th: 'tha'
+};
+
+function ocrLangs(sourceLang) {
+  if (sourceLang !== 'auto' && OCR_LANGS[sourceLang]) return OCR_LANGS[sourceLang];
+  return 'eng+jpn+kor';
+}
+
+let offscreenReady = null;
+async function ensureOffscreen() {
+  if (!offscreenReady) {
+    offscreenReady = (async () => {
+      const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+      if (contexts.length === 0) {
+        await chrome.offscreen.createDocument({
+          url: 'offscreen.html',
+          reasons: ['WORKERS'],
+          justification: 'Run Tesseract OCR to extract text positions from images'
+        });
+      }
+    })();
+  }
+  return offscreenReady;
+}
+
+async function translateImage(imageUrl, sourceLang, targetLang) {
   const { mediaType, data } = await fetchImageAsBase64(imageUrl);
   if (data.length > 6_000_000) throw new Error('Image too large');
+  const dataUrl = `data:${mediaType};base64,${data}`;
 
-  const content = [
-    {
-      type: 'image',
-      source: { type: 'base64', media_type: mediaType, data }
-    },
-    { type: 'text', text: buildImagePrompt(targetLang) }
-  ];
+  await ensureOffscreen();
+  const ocr = await chrome.runtime.sendMessage({
+    target: 'offscreen',
+    action: 'ocr',
+    dataUrl,
+    langs: ocrLangs(sourceLang)
+  });
+  if (!ocr?.ok) throw new Error(ocr?.error || 'OCR failed');
+  if (ocr.lines.length === 0) return { lines: [] };
 
-  const raw = await callAI(content, 2048);
-  const result = extractJson(raw);
+  const texts = ocr.lines.map(l => l.text);
+  const translations = await translateTexts(texts, sourceLang, targetLang);
+
   return {
-    hasText: !!result.hasText,
-    translation: typeof result.translation === 'string' ? result.translation : ''
+    lines: ocr.lines.map((l, i) => ({ bbox: l.bbox, translation: translations[i] }))
   };
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.target === 'offscreen') return;
+
   if (message.action === 'aiTranslateTexts') {
     translateTexts(message.texts, message.sourceLang, message.targetLang)
       .then(translations => sendResponse({ ok: true, translations }))
@@ -250,7 +273,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.action === 'aiTranslateImage') {
-    translateImage(message.imageUrl, message.targetLang)
+    translateImage(message.imageUrl, message.sourceLang || 'auto', message.targetLang)
       .then(result => sendResponse({ ok: true, ...result }))
       .catch(err => sendResponse({ ok: false, error: err.message }));
     return true;
