@@ -9,10 +9,59 @@
   const MIN_IMG_SIZE = 80;
   const OVERLAY_CLASS = 'ai-translate-img-overlay';
 
+  const LOADING_CLASS = 'ai-translate-loading';
+  const IMG_BADGE_CLASS = 'ai-translate-img-badge';
+
   const originalTexts = new Map();
   const textCache = new Map();
   const imageCache = new Map();
   const overlays = [];
+  const loadingCounts = new Map();
+
+  function injectStyles() {
+    if (document.getElementById('ai-translate-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'ai-translate-styles';
+    style.textContent = `
+      @keyframes aiTranslatePulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 0.8; } }
+      .${LOADING_CLASS} { animation: aiTranslatePulse 1.2s ease-in-out infinite !important; }
+      .${IMG_BADGE_CLASS} {
+        position: absolute; z-index: 2147483646; padding: 2px 8px;
+        background: rgba(0,0,0,0.75); color: #fff; font-size: 11px;
+        border-radius: 10px; pointer-events: none;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        animation: aiTranslatePulse 1.2s ease-in-out infinite;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+  injectStyles();
+
+  function markLoading(els) {
+    for (const el of els) {
+      const c = loadingCounts.get(el) || 0;
+      if (c === 0) el.classList.add(LOADING_CLASS);
+      loadingCounts.set(el, c + 1);
+    }
+  }
+
+  function unmarkLoading(els) {
+    for (const el of els) {
+      const c = (loadingCounts.get(el) || 1) - 1;
+      if (c <= 0) {
+        loadingCounts.delete(el);
+        el.classList.remove(LOADING_CLASS);
+      } else {
+        loadingCounts.set(el, c);
+      }
+    }
+  }
+
+  function clearAllLoading() {
+    loadingCounts.forEach((_, el) => el.classList.remove(LOADING_CLASS));
+    loadingCounts.clear();
+    document.querySelectorAll(`.${IMG_BADGE_CLASS}`).forEach(b => b.remove());
+  }
   let translated = false;
   let running = false;
   let cancelled = false;
@@ -130,7 +179,16 @@
     const tasks = batches.map(batch => async () => {
       if (fatalError) return;
       const texts = batch.map(([text]) => text);
-      const res = await sendBg({ action: 'aiTranslateTexts', texts, sourceLang, targetLang });
+      const parents = [...new Set(
+        batch.flatMap(([, nodeList]) => nodeList.map(n => n.parentElement).filter(Boolean))
+      )];
+      markLoading(parents);
+      let res;
+      try {
+        res = await sendBg({ action: 'aiTranslateTexts', texts, sourceLang, targetLang });
+      } finally {
+        unmarkLoading(parents);
+      }
 
       if (res.ok) {
         batch.forEach(([text], j) => {
@@ -153,13 +211,18 @@
     if (fatalError) throw fatalError;
   }
 
+  function overlayAnchor(img) {
+    return img.offsetParent || document.body;
+  }
+
   function positionLineOverlay(overlay, img, frac) {
-    const rect = img.getBoundingClientRect();
-    const lineHeight = frac.h * rect.height;
+    const w = img.offsetWidth;
+    const h = img.offsetHeight;
+    const lineHeight = frac.h * h;
     const fontSize = Math.min(Math.max(lineHeight * 0.75, 9), 16);
-    overlay.style.left = `${rect.left + window.scrollX + frac.x * rect.width}px`;
-    overlay.style.top = `${rect.top + window.scrollY + frac.yBottom * rect.height}px`;
-    overlay.style.maxWidth = `${rect.width - frac.x * rect.width}px`;
+    overlay.style.left = `${img.offsetLeft + frac.x * w}px`;
+    overlay.style.top = `${img.offsetTop + frac.yBottom * h}px`;
+    overlay.style.maxWidth = `${w - frac.x * w}px`;
     overlay.style.fontSize = `${fontSize}px`;
   }
 
@@ -191,8 +254,18 @@
       fontFamily: '-apple-system, BlinkMacSystemFont, sans-serif'
     });
     positionLineOverlay(overlay, img, frac);
-    document.body.appendChild(overlay);
+    overlayAnchor(img).appendChild(overlay);
     overlays.push({ overlay, img, frac });
+  }
+
+  function createImgBadge(img) {
+    const badge = document.createElement('div');
+    badge.className = IMG_BADGE_CLASS;
+    badge.textContent = '번역 중…';
+    badge.style.left = `${img.offsetLeft + 6}px`;
+    badge.style.top = `${img.offsetTop + 6}px`;
+    overlayAnchor(img).appendChild(badge);
+    return badge;
   }
 
   function repositionAll() {
@@ -202,11 +275,16 @@
   }
   window.addEventListener('resize', repositionAll);
 
-  async function translateImages(engine, sourceLang, targetLang) {
+  const processedImages = new Set();
+
+  async function translateImages(engine, sourceLang, targetLang, { reportTotal = true } = {}) {
     const imgs = [...document.querySelectorAll('img')].filter(img => {
+      if (processedImages.has(img)) return false;
       const r = img.getBoundingClientRect();
       return r.width >= MIN_IMG_SIZE && r.height >= MIN_IMG_SIZE && img.currentSrc;
     }).slice(0, 10);
+
+    imgs.forEach(img => processedImages.add(img));
 
     const total = imgs.length;
     let done = 0;
@@ -215,15 +293,20 @@
       const key = `${engine}|${sourceLang}|${targetLang}|${img.currentSrc}`;
       let lines = imageCache.get(key);
       if (lines === undefined) {
-        const res = await sendBg({
-          action: 'aiTranslateImage',
-          imageUrl: img.currentSrc,
-          sourceLang,
-          targetLang
-        });
-        if (res.ok) {
-          lines = res.lines;
-          imageCache.set(key, lines);
+        const badge = createImgBadge(img);
+        try {
+          const res = await sendBg({
+            action: 'aiTranslateImage',
+            imageUrl: img.currentSrc,
+            sourceLang,
+            targetLang
+          });
+          if (res.ok) {
+            lines = res.lines;
+            imageCache.set(key, lines);
+          }
+        } finally {
+          badge.remove();
         }
       }
       if (cancelled) return;
@@ -233,14 +316,81 @@
         }
       }
       done++;
-      reportProgress(done, total, 'image');
+      if (reportTotal) reportProgress(done, total, 'image');
     });
 
     await runPool(tasks, IMAGE_CONCURRENCY);
   }
 
+  let activeConfig = null;
+  let dynamicPassRunning = false;
+  let dynamicPassPending = false;
+  let dynamicTimer = null;
+
+  async function runDynamicPass() {
+    if (!activeConfig || dynamicPassRunning) {
+      dynamicPassPending = dynamicPassRunning;
+      return;
+    }
+    dynamicPassRunning = true;
+    try {
+      do {
+        dynamicPassPending = false;
+        await translateImages(
+          activeConfig.engine, activeConfig.sourceLang, activeConfig.targetLang,
+          { reportTotal: false }
+        );
+      } while (dynamicPassPending && activeConfig);
+    } finally {
+      dynamicPassRunning = false;
+    }
+  }
+
+  function scheduleDynamicPass() {
+    if (!activeConfig) return;
+    clearTimeout(dynamicTimer);
+    dynamicTimer = setTimeout(runDynamicPass, 600);
+  }
+
+  window.addEventListener('scroll', scheduleDynamicPass, { passive: true });
+  document.addEventListener('load', e => {
+    if (e.target?.tagName === 'IMG') scheduleDynamicPass();
+  }, true);
+
+  const mutationObserver = new MutationObserver(mutations => {
+    if (!activeConfig) return;
+    for (const m of mutations) {
+      if (m.type === 'attributes') {
+        if (m.target.tagName === 'IMG') {
+          processedImages.delete(m.target);
+          scheduleDynamicPass();
+          return;
+        }
+      } else {
+        for (const node of m.addedNodes) {
+          if (node.nodeType !== 1) continue;
+          if (node.classList?.contains(OVERLAY_CLASS)) continue;
+          if (node.tagName === 'IMG' || node.querySelector?.('img')) {
+            scheduleDynamicPass();
+            return;
+          }
+        }
+      }
+    }
+  });
+  mutationObserver.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['src', 'srcset']
+  });
+
   function restore() {
     cancelled = true;
+    activeConfig = null;
+    clearTimeout(dynamicTimer);
+    processedImages.clear();
+    clearAllLoading();
     originalTexts.forEach((original, node) => {
       if (node.isConnected) node.textContent = original;
     });
@@ -258,6 +408,11 @@
       }
       running = true;
       cancelled = false;
+      activeConfig = {
+        engine: message.engine || 'ai',
+        sourceLang: message.sourceLang,
+        targetLang: message.targetLang
+      };
       (async () => {
         try {
           await translateAllText(message.engine || 'ai', message.sourceLang, message.targetLang);
