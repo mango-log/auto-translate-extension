@@ -239,11 +239,53 @@ async function ensureOffscreen() {
   return offscreenReady;
 }
 
-async function translateImage(imageUrl, sourceLang, targetLang) {
-  const { mediaType, data } = await fetchImageAsBase64(imageUrl);
-  if (data.length > 6_000_000) throw new Error('Image too large');
-  const dataUrl = `data:${mediaType};base64,${data}`;
+async function imageDims(dataUrl) {
+  const blob = await (await fetch(dataUrl)).blob();
+  const bmp = await createImageBitmap(blob);
+  const dims = { width: bmp.width, height: bmp.height };
+  bmp.close();
+  return dims;
+}
 
+function buildVisionPrompt(targetLang) {
+  return [
+    `Find every distinct readable text region in this image and translate each to ${langName(targetLang)}.`,
+    'Respond with ONLY a JSON array, no markdown or code fences:',
+    '[{"box":[x0,y0,x1,y1],"t":"translated text"}]',
+    'Coordinates are integers 0-1000 relative to image width and height (x rightward, y downward),',
+    'drawn tightly around each text region. One entry per visual text line or short label.',
+    'Skip watermarks and unreadable text. If there is no text, respond [].'
+  ].join('\n');
+}
+
+async function translateImageAI(mediaType, data, targetLang, dataUrl) {
+  const [dims, raw] = await Promise.all([
+    imageDims(dataUrl),
+    callAI([
+      { type: 'image', source: { type: 'base64', media_type: mediaType, data } },
+      { type: 'text', text: buildVisionPrompt(targetLang) }
+    ], 4096)
+  ]);
+
+  const arr = extractJson(raw);
+  if (!Array.isArray(arr)) throw new Error('Unexpected vision response shape');
+
+  return {
+    lines: arr
+      .filter(item => Array.isArray(item.box) && item.box.length === 4 && typeof item.t === 'string' && item.t)
+      .map(item => ({
+        bbox: {
+          x0: (item.box[0] / 1000) * dims.width,
+          y0: (item.box[1] / 1000) * dims.height,
+          x1: (item.box[2] / 1000) * dims.width,
+          y1: (item.box[3] / 1000) * dims.height
+        },
+        translation: item.t
+      }))
+  };
+}
+
+async function translateImageOCR(dataUrl, sourceLang, targetLang) {
   await ensureOffscreen();
   const ocr = await chrome.runtime.sendMessage({
     target: 'offscreen',
@@ -260,6 +302,18 @@ async function translateImage(imageUrl, sourceLang, targetLang) {
   return {
     lines: ocr.lines.map((l, i) => ({ bbox: l.bbox, translation: translations[i] }))
   };
+}
+
+async function translateImage(imageUrl, sourceLang, targetLang) {
+  const { mediaType, data } = await fetchImageAsBase64(imageUrl);
+  if (data.length > 6_000_000) throw new Error('Image too large');
+  const dataUrl = `data:${mediaType};base64,${data}`;
+
+  const { engine, apiKey } = await getSettings();
+  if (engine === 'ai' && apiKey) {
+    return translateImageAI(mediaType, data, targetLang, dataUrl);
+  }
+  return translateImageOCR(dataUrl, sourceLang, targetLang);
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {

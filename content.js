@@ -275,120 +275,99 @@
   }
   window.addEventListener('resize', repositionAll);
 
+  let activeConfig = null;
   const processedImages = new Set();
 
-  async function translateImages(engine, sourceLang, targetLang, { reportTotal = true } = {}) {
-    const imgs = [...document.querySelectorAll('img')].filter(img => {
-      if (processedImages.has(img)) return false;
-      const r = img.getBoundingClientRect();
-      return r.width >= MIN_IMG_SIZE && r.height >= MIN_IMG_SIZE && img.currentSrc;
-    }).slice(0, 10);
-
-    imgs.forEach(img => processedImages.add(img));
-
-    const total = imgs.length;
-    let done = 0;
-
-    const tasks = imgs.map(img => async () => {
-      const key = `${engine}|${sourceLang}|${targetLang}|${img.currentSrc}`;
-      let lines = imageCache.get(key);
-      if (lines === undefined) {
-        const badge = createImgBadge(img);
-        try {
-          const res = await sendBg({
-            action: 'aiTranslateImage',
-            imageUrl: img.currentSrc,
-            sourceLang,
-            targetLang
-          });
-          if (res.ok) {
-            lines = res.lines;
-            imageCache.set(key, lines);
-          }
-        } finally {
-          badge.remove();
-        }
-      }
-      if (cancelled) return;
-      if (lines) {
-        for (const line of lines) {
-          if (line.translation) createLineOverlay(img, line.bbox, line.translation);
-        }
-      }
-      done++;
-      if (reportTotal) reportProgress(done, total, 'image');
-    });
-
-    await runPool(tasks, IMAGE_CONCURRENCY);
+  function eligibleImage(img) {
+    if (processedImages.has(img)) return false;
+    const r = img.getBoundingClientRect();
+    return r.width >= MIN_IMG_SIZE && r.height >= MIN_IMG_SIZE && img.currentSrc;
   }
 
-  let activeConfig = null;
-  let dynamicPassRunning = false;
-  let dynamicPassPending = false;
-  let dynamicTimer = null;
+  async function translateOneImage(img) {
+    if (!activeConfig || processedImages.has(img) || !eligibleImage(img)) return;
+    processedImages.add(img);
+    imageObserver.unobserve(img);
 
-  async function runDynamicPass() {
-    if (!activeConfig || dynamicPassRunning) {
-      dynamicPassPending = dynamicPassRunning;
-      return;
+    const { engine, sourceLang, targetLang } = activeConfig;
+    const key = `${engine}|${sourceLang}|${targetLang}|${img.currentSrc}`;
+
+    let lines = imageCache.get(key);
+    if (lines === undefined) {
+      const badge = createImgBadge(img);
+      try {
+        const res = await sendBg({
+          action: 'aiTranslateImage',
+          imageUrl: img.currentSrc,
+          sourceLang,
+          targetLang
+        });
+        if (res.ok) {
+          lines = res.lines;
+          imageCache.set(key, lines);
+        } else {
+          processedImages.delete(img);
+        }
+      } finally {
+        badge.remove();
+      }
     }
-    dynamicPassRunning = true;
-    try {
-      do {
-        dynamicPassPending = false;
-        await translateImages(
-          activeConfig.engine, activeConfig.sourceLang, activeConfig.targetLang,
-          { reportTotal: false }
-        );
-      } while (dynamicPassPending && activeConfig);
-    } finally {
-      dynamicPassRunning = false;
+    if (cancelled || !activeConfig) return;
+    if (lines) {
+      for (const line of lines) {
+        if (line.translation) createLineOverlay(img, line.bbox, line.translation);
+      }
     }
   }
 
-  function scheduleDynamicPass() {
+  const imageObserver = new IntersectionObserver((entries) => {
     if (!activeConfig) return;
-    clearTimeout(dynamicTimer);
-    dynamicTimer = setTimeout(runDynamicPass, 600);
+    for (const entry of entries) {
+      if (entry.isIntersecting) {
+        translateOneImage(entry.target);
+      }
+    }
+  }, { rootMargin: '200px' });
+
+  function observeAllImages() {
+    document.querySelectorAll('img').forEach(img => imageObserver.observe(img));
   }
 
-  window.addEventListener('scroll', scheduleDynamicPass, { passive: true });
-  document.addEventListener('load', e => {
-    if (e.target?.tagName === 'IMG') scheduleDynamicPass();
-  }, true);
+  async function translateImages() {
+    observeAllImages();
+    document.querySelectorAll('img').forEach(img => {
+      const r = img.getBoundingClientRect();
+      if (r.top < window.innerHeight && r.bottom > 0 && eligibleImage(img)) {
+        translateOneImage(img);
+      }
+    });
+  }
 
   const mutationObserver = new MutationObserver(mutations => {
     if (!activeConfig) return;
     for (const m of mutations) {
-      if (m.type === 'attributes') {
-        if (m.target.tagName === 'IMG') {
-          processedImages.delete(m.target);
-          scheduleDynamicPass();
-          return;
-        }
+      if (m.type === 'attributes' && m.target.tagName === 'IMG') {
+        processedImages.delete(m.target);
+        imageObserver.observe(m.target);
       } else {
         for (const node of m.addedNodes) {
           if (node.nodeType !== 1) continue;
           if (node.classList?.contains(OVERLAY_CLASS)) continue;
-          if (node.tagName === 'IMG' || node.querySelector?.('img')) {
-            scheduleDynamicPass();
-            return;
+          if (node.tagName === 'IMG') {
+            imageObserver.observe(node);
+          } else {
+            node.querySelectorAll?.('img').forEach(img => imageObserver.observe(img));
           }
         }
       }
     }
-  });
-  mutationObserver.observe(document.body, {
-    childList: true,
-    subtree: true,
-    attributes: true,
-    attributeFilter: ['src', 'srcset']
   });
 
   function restore() {
     cancelled = true;
     activeConfig = null;
-    clearTimeout(dynamicTimer);
+    imageObserver.disconnect();
+    mutationObserver.disconnect();
     processedImages.clear();
     clearAllLoading();
     originalTexts.forEach((original, node) => {
@@ -413,10 +392,16 @@
         sourceLang: message.sourceLang,
         targetLang: message.targetLang
       };
+      mutationObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['src', 'srcset']
+      });
+      translateImages();
       (async () => {
         try {
           await translateAllText(message.engine || 'ai', message.sourceLang, message.targetLang);
-          if (!cancelled) await translateImages(message.engine || 'ai', message.sourceLang, message.targetLang);
           translated = !cancelled;
           chrome.runtime.sendMessage({
             action: 'translateDone',
