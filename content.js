@@ -256,11 +256,22 @@
     }
   });
 
+  const SECRET_PATTERN = /(sk-|pk-|api[_-]?key|ghp_|gho_|github_pat_|xox[baprs]-|AKIA|ya29\.|Bearer\s)/i;
+
+  function looksSensitive(text) {
+    if (SECRET_PATTERN.test(text)) return true;
+    if (!/\s/.test(text) && text.length > 20) return true;
+    return false;
+  }
+
   let lastSelection = '';
   document.addEventListener('mouseup', () => {
     setTimeout(() => {
+      const active = document.activeElement;
+      if (active && ['INPUT', 'TEXTAREA'].includes(active.tagName)) return;
       const text = (window.getSelection()?.toString() || '').trim();
       if (!text || text === lastSelection || text.length > 3000) return;
+      if (looksSensitive(text)) return;
       lastSelection = text;
       chrome.runtime.sendMessage({ action: 'selectionChanged', text }).catch?.(() => {});
     }, 10);
